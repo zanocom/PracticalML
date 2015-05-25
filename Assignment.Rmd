@@ -5,18 +5,322 @@ date: "Thursday, May 14, 2015"
 output: html_document
 ---
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+# WEIGHT LIFTING EXERCISE RECOGNITION
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+## ABSTRACT
+
+The following code is part of the assignments of Practical Machine Learning Course  
+of Data Science Specialization.  
+The project aims to analyze the data collected from wearable devices such as Jawbone Up,  
+Nike FuelBand, and Fitbit and to classify whether a certain weight lifting exercise has been  
+performed correctly. The exercises have been performed in 5 different ways.    
+More information are available at this [website](http://groupware.les.inf.puc-rio.br/har).
+In the following code we choose the most effective algorithm and perform the classification on 20  
+observations from the test set using a random forest model.  
+The predicted result is correct on all 20 cases.  
+
+In order to reproduce the results the [training](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and [test](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv) datasets should be saved into the working directory.  
+
+
+
+## DATA LOADING
+
+We start the analysis loading the required packages.
+  
+```{r libraries , echo=TRUE , results='hide' , warning=FALSE , include=FALSE }
+  library ( rpart )
+  library ( randomForest )
+  library ( caret )
+  library ( splines )
+  library ( MASS )
+  library ( Hmisc )
+  library ( dplyr )
+  library(corrgram)
+  library (reshape)
+  library (knitr)
+
+  library ( foreach )
+  library ( parallel )
+  library ( doSNOW )
+```
+
+```{r setup, include=FALSE}
+    knitr::opts_chunk$set(cache=TRUE)
+```
+
+
+Then we load the datasets:
+```{r datasets}
+    training_full <- read.table( "pml-training.csv" , header = TRUE , sep= ",")
+    test_full <- read.table( "pml-testing.csv" , header = TRUE , sep= ",")
+
+    dim ( training_full )
+    dim ( test_full )
+```
+Now the datasets are ready to be processed.
+
+## DATA PREPROCESSING
+### NAs removal
+We see that the datasets contain a lof of NAs values.  
+Since only a subset of columns from test set is not NA we focus on valid columns (with less than 20 NAs).
+    
+Then we exclude from the analysis the columns `r colnames(test_full)[1:7]` because we we focus only on data from the  sensors.
+
+```{r valid_cols ,echo=TRUE }
+    valid_columns  <- apply(  test_full , 2 , function(x)  sum(is.na(x)) )!= 20   
+    training_full <- training_full[,valid_columns ]  
+    test_full     <- test_full[,valid_columns ]
+
+    training_full <- training_full[,8:60]  
+    test_full     <- test_full[,8:59] 
+
+```
+
+### Near Zero Variance variable
+  
+We verify the presence of variables with reduced variability.  
+```{r nearzerovar}
+    nearZeroVar(training_full , saveMetrics = FALSE )
+    nearZeroVar(test_full , saveMetrics = FALSE )
+```
+We see that there are no problems of zero variance variables.
+  
+## EXPLORATORY DATA  ANALYSIS
+
+We start the analysis of the training set focusing on a subset of rows to avoid computational problems. 
+
+```{r }
+    idx_quarter <- createDataPartition( y=training_full$classe , p= 0.25 ,list=FALSE)  
+    training <- training_full[idx_quarter,]
+```
+The dimension of the reduced dataset is now  `r nrow(training)` rows.
+We verify the presence of correlated variables using a correlogram chart.
+```{r correlogram}
+    corrgram(training[,-53], order=TRUE, lower.panel=panel.shade,
+      upper.panel=panel.pie, text.panel=panel.txt,
+      main="Data in PC2/PC1 Order")
+```
+
+We show the variables with highest correlation.
+```{r correlation }
+    corr<-cor(training[,-53] )
+    
+    diag(corr)<-NA
+    corr[upper.tri(corr)]<-NA
+    
+    corr <-  melt(corr) 
+    corr <-  corr[abs(corr$value)>0.8,] 
+    corr <- corr[!is.na(corr$value),]
+    corr <- corr[order(abs(corr$value),decreasing= TRUE),]
+    rownames(corr) <- NULL
+    kable(corr , digit=2 )
+```
+We end the data exploration plotting the observations using the first 2 principal components.
+```{r pca}
+    procPCA <- preProcess(training[,-53] , method='pca' )
+    training_pca <- predict ( object= procPCA , newdata= training[,-53]   )
+    
+    ggplot (  training_pca , aes( x= PC1 , y= PC2 , color=  training$classe ) ) +
+      geom_point( )+
+      labs(title= "Chart 1\nTraining Exercises with respect\nto the main principal components")+
+      scale_colour_discrete(name  ="Exercise\nClass")
+    
+```  
+  
+Chart 1 shows a pattern of 5 diffent clouds of points.
+Inside each cloud the 5 classes overlap.
+
+
+## MODEL SELECTION
+  
+In this project we examine 3 different classification models:  
+* GLM stepwise regression with original variables  
+* GLM stepwise regression with principal components  
+* Random Forest  
+  
+The final model will be selected using 5 fold cross validation accuracy metric.   
+First of all we compute the benchmark classification performance using 2 criteria for prediction:  
+the modal class prediction and the proportional probability prediction.  
+The modal class prediction classifies every observation using the most frequent class in the dataset.  
+The proportional probability correctly predicts each class using the relative frequency ratio of the class.  
+  
+### Benchmark classification
+
+```{r benchmark, echo=TRUE , results='hide' , warning=FALSE , message=FALSE}
+    model_accuracy <- data.frame(model=character(5), accuracy=numeric(5))
+    set.seed( 647 )
+    idx <- sample ( 1:5 , nrow(training) , replace=TRUE ) # fold index
+    predicted_accuracy_bench_modal <- predicted_accuracy_bench_prop <- numeric ( 5 )
+
+    for( fo in 1:5 ) # fold
+    {
+      train_idx <- idx != fo
+      test_idx  <- idx == fo
+      prediction_benchmark_modal <- prediction_benchmark_prop <- array( NA, dim= c(sum(test_idx),5) )      
+      
+      prediction_benchmark_modal <- names(which.max( table(training[train_idx,"classe"]) ))
+      predicted_accuracy_bench_modal[fo] <- sum ( diag( table ( rep(prediction_benchmark_modal,nrow(training[test_idx,])) , training[test_idx,"classe"] ) ) ) / nrow(training[test_idx,])  # 0.2844617
+      predicted_accuracy_bench_prop[fo] <-  sum( round( table(training[test_idx,"classe"]) * prop.table(table(training[test_idx,"classe"]) ),0 ) ) / nrow(training[test_idx,])  # 0.2844617  
+    }
+
+    model_accuracy$model  <- "modal benchmark"
+    model_accuracy$accuracy  <- mean ( predicted_accuracy_bench_modal )
+    
+    model_accuracy$model[2]  <-  "prop.prob. benchmark" 
+    model_accuracy$accuracy[2]  <- mean ( predicted_accuracy_bench_prop )
+
+```  
+
+
+### GLM Stepwise regression with original variables
+We perform stepwise logstic regression model starting from only intercept model and sequentially  
+adding/removing variables using AIC metric.
+We use the one-vs-all method to identify the response variable.
+We compute accuracy in 5 fold cross validation.
+
+```{r glm, echo=TRUE , results='hide' , warning=FALSE , message=FALSE}
+      set.seed( 647 )
+      idx <- sample ( 1:5 , nrow(training) , replace=TRUE ) # fold index
+      predicted_accuracy_step <- numeric ( 5 )
+      
+      for( fo in 1:5 ) # fold
+      {
+        train_idx <- idx != fo
+        test_idx  <- idx == fo
+        prediction <- array ( NA, dim= c(sum(test_idx),5)  )
+        
+        # fo <- 1
+        for( f in 1:5 ) {        
+                  y <- factor(training$classe == levels( training$classe )[f])    # choose outcome
+                  fmla <- as.formula( paste( "y[train_idx]" ,  paste(colnames(training)[-53] ,sep="",collapse="+") , sep= "~" )  )
+                  fit_glm <- glm( y[train_idx]~ 1  , data= training[train_idx,-53]  , family="binomial" )
+                  fit_step <- step( fit_glm  , scope = fmla , direction= "both" , k=2 )
+                  
+                  # probability of classe y
+                  prediction[,f] <- predict( fit_step , newdata= training[test_idx,-53] , type="response")
+                  cat("Response: " , f , "\n")
+                }
+        
+        predicted_class <- levels( training$classe ) [ apply( prediction , 1 , which.max ) ]
+        predicted_accuracy_step[fo] <- sum ( diag( table(predicted_class , training[test_idx,"classe"]))) / nrow(training[test_idx,])    
+        cat("Fold: " , fo , "\n")
+      }
+
+
+    model_accuracy$model[3]  <- "GLM stepwise"
+    model_accuracy$accuracy[3]  <- mean ( predicted_accuracy_step )
+
+```
+
+
+### GLM Stepwise regression with princicpal components
+We perform stepwise logstic regression model starting from only intercept model and sequentially  
+adding/removing variables using AIC metric.
+The model is built using the principal components. 
+We use the one-vs-all method to identify the response variable.
+We compute accuracy in 5 fold cross  validation.
+
+```{r glm_pca , echo=TRUE , results='hide' , warning=FALSE , message=FALSE}
+    set.seed( 647 )
+    idx <- sample ( 1:5 , nrow(training) , replace=TRUE ) # fold index
+    predicted_accuracy_step_pca <- numeric ( 5 )
+    
+    for( fo in 1:5 ) # fold
+    {
+      train_idx <- idx != fo
+      test_idx  <- idx == fo
+      prediction_pca <- array ( NA, dim= c(sum(test_idx),5)  )
+    
+      procPCA <- preProcess(training[,-53] , method='pca' )
+      training_pca <- predict ( object= procPCA , newdata= training[ train_idx ,-53]   )
+      test_pca <- predict ( object= procPCA , newdata= training[ test_idx ,-53] )
+      
+      for( f in 1:5 ) {        
+        y <- factor( training$classe == levels( training$classe )[f])    # choose outcome
+        fmla <- as.formula( paste( "y[train_idx]" ,  paste(colnames(training_pca) ,sep="",collapse="+") , sep= "~" )  )
+        fit_glm_pca <- glm( y[train_idx]~ 1  , data= training_pca  , family="binomial" )
+        fit_step_pca <- step( fit_glm_pca  , scope = fmla , direction= "both" , k=2 )
+        
+        # probability of classe y
+        prediction_pca[,f] <- predict( fit_step_pca , newdata= test_pca , type="response")
+        cat("Fold: " , fo , "\n")
+        cat("Response: " , f , "\n")
+      }
+      predicted_class_pca <- levels( training$classe ) [ apply( prediction_pca , 1 , which.max ) ]
+      predicted_accuracy_step_pca[fo] <- sum ( diag( table(predicted_class_pca , training[ test_idx ,"classe"]))) / nrow(test_pca)    
+    }
+    
+    model_accuracy$model[4]  <- "GLM stepwise PCA"
+    model_accuracy$accuracy[4]  <- mean ( predicted_accuracy_step_pca )
+```
+
+
+### RANDOM FOREST
+We train the random forest model using a reduced dataset.  
+We find the best parameter regarding the number of variables analyzed at each node.
+We run the algorithm in parallel to get faster results.
+              
+```{r rf, echo=TRUE , results='hide' , warning=FALSE , message=FALSE}
+      cl <- makeCluster(spec= 4, type = getClusterOption("type") )
+      registerDoSNOW(cl)
+      ## All subsequent models are then run in parallel
+
+      fr_grid <- data.frame( mtry=c( 2:7,seq(8,20,by=2),30) )  # 15    0.9779885
+
+      set.seed( 647 )
+
+      fit_rf <- train( classe~ .  , data= training , method="rf" , 
+                       trControl= trainControl(method="cv",number=5) ,
+                       tuneGrid=fr_grid ,
+                       prox=TRUE, allowParallel=TRUE)
+
+      stopCluster(cl)
+
+```
+We use accuracy was used to select the optimal model using  the largest value.  
+The final value used for the model was mtry = 10. 
 
 ```{r}
-summary(cars)
+    model_accuracy$model[5]  <- "random forest"
+    model_accuracy$accuracy[5]  <- 1-fit_rf$finalModel$err.rate[500,"OOB"]
+```
+  
+An interesting feature of the random forest model is the importance of the variables for prediction.  
+In the following chart we plot the observation using the 2 most important variables.  
+We can still see the presence of 5 clusters but there is less overlapping among different classes.  
+
+```{r importance}
+        varImportance <- data.frame(fit_rf$finalModel$importance)
+        varImportance$names <- rownames (varImportance )
+        varImportance <- tbl_df(varImportance )
+        varImportance <- varImportance %>% 
+                            arrange(  desc(MeanDecreaseGini) )
+
+
+        ggplot (  training , aes( x= roll_belt , y= yaw_belt , color=  classe ) ) +
+          geom_point( )+
+          labs(title= "Chart 2\nTraining Exercises with respect\nto the most important variables")
+
 ```
 
-You can also embed plots, for example:
+## FINAL PREDICTION Final predition on test set
+We show the cross validation accuracy of each model.
 
-```{r, echo=FALSE}
-plot(cars)
+```{r}
+    kable( model_accuracy , digit= 2 )
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+We select the model with the best accuracy to make the final prediction.
+```{r}
+    model_accuracy[which.max(model_accuracy$accuracy),]
+```
+We train the random forest on the full training set and then predict the test set observation.
+  
+```{r finalrf}
+      set.seed( 777 )
+      fit_rf_final <- randomForest( classe~ .  , data= training_full , mtry= 10 )
+
+      answers <-   predict ( fit_rf_final , test_full )
+```
+
+END OF CODE
