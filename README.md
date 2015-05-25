@@ -1,2 +1,2 @@
 # PracticalML
-Assignment for Data Sciecne Specialization
+Assignment for Data Science Specialization - Practical Machine Learning Course
